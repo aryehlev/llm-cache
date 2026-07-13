@@ -19,12 +19,18 @@ A zero-dependency Rust library implementing the PCOE core:
 | `trie` | §3.1 | Decayed prefix trie over hashed token blocks: EWMA arrival rates, inter-arrival gap histograms, GC, node budget. No prompt content retained. |
 | `price` | §2 | Two-regime price sheets (storage-metered / write-premium) with `gemini_pro_like()` and `anthropic_sonnet_like()` presets; `tau_hold = p_in / p_store`. |
 | `plan` | §3.2 | Value function and budgeted tree-knapsack DP for ≤ K breakpoint placement under exclusive coverage, with gap-histogram TTL-tier selection and hysteresis. |
-| `engine` | §3.3 | Ski-rental lifecycle controller emitting `Create` / `Extend` / `Delete` actions, rate-informed early exit, dominated-ancestor retirement, fail-open. |
-| `chunk` | §3.1 | Token/byte block hashing helpers. |
+| `engine` | §3.3 | Ski-rental lifecycle controller emitting `Create` / `Extend` / `Delete` actions with pending-create confirmation (`confirm_create` / `mark_failed` / timeout), rate-informed early exit, dominated-ancestor retirement, fail-open. |
+| `shape` | §3.4a | Stable→volatile boundary detection from trie fan-out: where the cacheable prefix ends, and what a cache point there would earn. |
+| `engine` (micro-batch) | §3.4b | Opt-in write-amortizing micro-batching: followers of an in-flight cache write get bounded `Defer` advice so one write premium covers the batch. |
+| `router` | §3.4c | Cross-provider routing on cache-state-aware marginal input cost (read-only quotes that don't pollute traffic stats). |
+| `adapter` | §5 | Wire-agnostic Gemini (`cachedContents` create/patch/delete + handle registry) and Anthropic (`cache_control` breakpoint offsets + TTL labels) translation layers. |
+| `chunk` | §3.1 | `Chunker` trait for pluggable tokenizers, plus token-ID and byte-block hashing helpers. |
 
 The engine is deterministic and clock-free (callers pass `now` in hours), talks to
-no provider directly (adapters execute the emitted actions), and is fail-open by
-construction — a wrong decision can only cost money, never change model output.
+no provider directly (adapters translate actions into concrete API operations the
+application executes with its own content — PCOE never holds prompt text), and is
+fail-open by construction — a wrong decision can only cost money, never change
+model output.
 
 ```rust
 use llm_cache::{Config, Engine, PriceSheet};

@@ -12,6 +12,41 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+/// Pluggable prompt-to-blocks conversion, so any tokenizer can drive the trie.
+///
+/// Implement this once around a real tokenizer for token-exact block
+/// boundaries:
+///
+/// ```ignore
+/// struct TiktokenChunker { bpe: tiktoken_rs::CoreBPE, block_tokens: usize }
+/// impl llm_cache::chunk::Chunker for TiktokenChunker {
+///     fn blocks(&self, prompt: &str) -> Vec<u64> {
+///         let tokens: Vec<u32> = self.bpe.encode_ordinary(prompt)
+///             .into_iter().map(|t| t as u32).collect();
+///         llm_cache::chunk::blocks_from_tokens(&tokens, self.block_tokens)
+///     }
+/// }
+/// ```
+pub trait Chunker {
+    /// Convert a prompt into block hashes for [`crate::Engine::observe`].
+    fn blocks(&self, prompt: &str) -> Vec<u64>;
+}
+
+/// Tokenizer-free [`Chunker`]: fixed-size byte blocks. With ~4 bytes/token on
+/// typical English text, `bytes_per_block = 4 * Config::block_tokens` keeps
+/// granularity roughly token-aligned. When using this, also scale token-based
+/// thresholds (`min_cacheable_tokens`) by the same approximation.
+pub struct ByteChunker {
+    /// Bytes per block.
+    pub bytes_per_block: usize,
+}
+
+impl Chunker for ByteChunker {
+    fn blocks(&self, prompt: &str) -> Vec<u64> {
+        blocks_from_bytes(prompt.as_bytes(), self.bytes_per_block)
+    }
+}
+
 fn hash_of(bytes: &[u8]) -> u64 {
     let mut h = DefaultHasher::new();
     bytes.hash(&mut h);

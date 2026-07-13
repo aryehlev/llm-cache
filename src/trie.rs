@@ -103,6 +103,13 @@ impl NodeStats {
 pub enum CacheState {
     /// No provider-side cache for this prefix.
     Uncached,
+    /// A create was requested but not yet confirmed by the adapter
+    /// ([`crate::Engine::confirm_create`]). Micro-batching defers followers
+    /// while a node is pending (DESIGN.md §3.4b).
+    Pending {
+        /// When the create action was emitted, hours.
+        since_hours: f64,
+    },
     /// A provider-side cache is (believed) live for this prefix.
     Cached {
         /// When the provider-side entry expires unless extended, hours.
@@ -224,6 +231,25 @@ impl PrefixTrie {
             self.nodes[next].stats.observe(now, self.tau_decay);
             path.push(next);
             cur = next;
+        }
+        path
+    }
+
+    /// Read-only path lookup: walk `blocks` from the root without recording a
+    /// traversal or materializing nodes. Stops at the first unseen block.
+    /// Used for cost quotes (e.g. cross-provider routing) that must not
+    /// pollute the traffic statistics.
+    pub fn peek_path(&self, blocks: &[u64]) -> Vec<NodeId> {
+        let mut path = Vec::new();
+        let mut cur = Self::ROOT;
+        for b in blocks {
+            match self.nodes[cur].children.get(b) {
+                Some(&id) => {
+                    path.push(id);
+                    cur = id;
+                }
+                None => break,
+            }
         }
         path
     }

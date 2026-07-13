@@ -34,13 +34,19 @@
 //! assert!(created);
 //! ```
 
+pub mod adapter;
 pub mod chunk;
 pub mod engine;
 pub mod plan;
 pub mod price;
+pub mod router;
+pub mod shape;
 pub mod trie;
 
-pub use engine::{Action, Config, Engine, Observation};
+pub use chunk::{ByteChunker, Chunker};
+pub use engine::{Action, Config, Defer, Engine, Observation};
 pub use plan::Placement;
 pub use price::{PriceSheet, Regime, TtlTier};
+pub use router::{cheapest_route, RouteCandidate};
+pub use shape::{stable_boundary, ShapeHint};
 pub use trie::{CacheState, NodeId, PrefixTrie};

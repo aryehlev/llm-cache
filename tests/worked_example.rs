@@ -70,6 +70,9 @@ fn business_day_costs_match_design_doc() {
             }
             cost += ct as f64 / 1e6 * p_read + (prefix_tokens - ct) as f64 / 1e6 * p_in;
             for a in &obs.actions {
+                if let Action::Create { node, .. } = a {
+                    eng.confirm_create(*node, now); // instantly-successful adapter
+                }
                 handle_action(
                     a,
                     now,

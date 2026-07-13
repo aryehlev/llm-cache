@@ -39,6 +39,14 @@ pub struct Config {
     pub gc_min_idle_hours: f64,
     /// Hard cap on trie size; beyond it, unseen suffixes are not materialized.
     pub max_nodes: usize,
+    /// Enable write-amortizing micro-batching (DESIGN.md §3.4b): followers of
+    /// an in-flight cache write receive a bounded defer advice so one write
+    /// premium is amortized across the batch. Off by default (adds latency).
+    pub enable_micro_batch: bool,
+    /// Maximum defer for a follower, hours (default 2 seconds).
+    pub micro_batch_defer_hours: f64,
+    /// A Create left unconfirmed this long is presumed failed and reverted.
+    pub pending_timeout_hours: f64,
 }
 
 impl Default for Config {
@@ -55,6 +63,9 @@ impl Default for Config {
             gc_min_lambda: 0.01,
             gc_min_idle_hours: 24.0,
             max_nodes: 200_000,
+            enable_micro_batch: false,
+            micro_batch_defer_hours: 2.0 / 3600.0,
+            pending_timeout_hours: 3.0 / 60.0,
         }
     }
 }
@@ -85,6 +96,17 @@ pub enum Action {
     },
 }
 
+/// Micro-batching advice: this request's prefix has a cache write in flight;
+/// briefly deferring dispatch lets it read the cache the leader is writing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Defer {
+    /// The pending node the request would read from once confirmed.
+    pub node: NodeId,
+    /// Latest time to wait until, hours; dispatch uncached at this deadline if
+    /// the create is still unconfirmed. Bounds added latency.
+    pub until_hours: f64,
+}
+
 /// Result of observing one outgoing request.
 #[derive(Clone, Debug)]
 pub struct Observation {
@@ -99,6 +121,9 @@ pub struct Observation {
     /// Lifecycle actions triggered by this observation (creations, and
     /// deletions of newly-dominated ancestors).
     pub actions: Vec<Action>,
+    /// Micro-batching advice ([`Config::enable_micro_batch`]); `None` unless a
+    /// cache write for this prefix is currently in flight.
+    pub defer: Option<Defer>,
 }
 
 /// The PCOE engine. One instance per (provider, model) — provider caches are
@@ -108,6 +133,7 @@ pub struct Engine {
     prices: PriceSheet,
     cfg: Config,
     cached: BTreeSet<NodeId>,
+    pending: BTreeSet<NodeId>,
 }
 
 impl Engine {
@@ -119,6 +145,7 @@ impl Engine {
             prices,
             cfg,
             cached: BTreeSet::new(),
+            pending: BTreeSet::new(),
         }
     }
 
@@ -162,6 +189,23 @@ impl Engine {
             }
         }
 
+        // Micro-batching: computed before any creation this observation might
+        // trigger, so a leader never defers on its own write.
+        let mut defer = None;
+        if self.cfg.enable_micro_batch && self.prices.regime() == Regime::StorageMetered {
+            for &id in path.iter().rev() {
+                if let CacheState::Pending { since_hours } = self.trie.node(id).state {
+                    if now - since_hours < self.cfg.micro_batch_defer_hours {
+                        defer = Some(Defer {
+                            node: id,
+                            until_hours: since_hours + self.cfg.micro_batch_defer_hours,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+
         let mut actions = Vec::new();
         if self.prices.regime() == Regime::StorageMetered {
             self.consider_create(&path, deepest_cached, now, &mut actions);
@@ -175,6 +219,7 @@ impl Engine {
             deepest_cached,
             cached_tokens,
             actions,
+            defer,
         }
     }
 
@@ -191,7 +236,16 @@ impl Engine {
         let Some(tau_hold) = self.prices.tau_hold_hours() else {
             return;
         };
-        let covered_tokens = deepest_cached.map_or(0, |id| self.trie.tokens(id));
+        // In-flight (Pending) creates count as coverage too: while one is in
+        // flight, a shallower create for the same traffic is pure waste.
+        let pending_tokens = path
+            .iter()
+            .rev()
+            .find(|&&id| matches!(self.trie.node(id).state, CacheState::Pending { .. }))
+            .map_or(0, |&id| self.trie.tokens(id));
+        let covered_tokens = deepest_cached
+            .map_or(0, |id| self.trie.tokens(id))
+            .max(pending_tokens);
 
         let mut chosen = None;
         for &id in path.iter().rev() {
@@ -236,18 +290,35 @@ impl Engine {
             tokens,
             ttl_hours: tau_hold,
         });
+        // The node stays Pending until the adapter confirms the provider-side
+        // create ([`Engine::confirm_create`]) or reports failure
+        // ([`Engine::mark_failed`]); a timeout in `tick()` is the backstop.
         {
             let node = self.trie.node_mut(id);
-            node.state = CacheState::Cached {
-                expires_at_hours: now + tau_hold,
-                ttl_hours: tau_hold,
-            };
+            node.state = CacheState::Pending { since_hours: now };
             node.last_flip = now;
         }
-        self.cached.insert(id);
+        self.pending.insert(id);
         // Cached ancestors this deeper cache dominates are retired by the
         // exclusive-traffic check in `tick()` once the new node's rate
         // estimator warms up enough to attribute the traffic correctly.
+    }
+
+    /// Confirm a provider-side create succeeded: the node's cache is live from
+    /// `now` for the TTL requested in the Create action.
+    pub fn confirm_create(&mut self, node: NodeId, now: f64) {
+        let Some(tau_hold) = self.prices.tau_hold_hours() else {
+            return;
+        };
+        if matches!(self.trie.node(node).state, CacheState::Pending { .. }) {
+            let n = self.trie.node_mut(node);
+            n.state = CacheState::Cached {
+                expires_at_hours: now + tau_hold,
+                ttl_hours: tau_hold,
+            };
+            self.pending.remove(&node);
+            self.cached.insert(node);
+        }
     }
 
     /// Periodic maintenance: ski-rental deletions, TTL extensions, and trie GC.
@@ -256,6 +327,24 @@ impl Engine {
     /// before provider-side expiry.
     pub fn tick(&mut self, now: f64) -> Vec<Action> {
         let mut actions = Vec::new();
+        // Presume unconfirmed creates failed after the timeout (fail-open: the
+        // node just becomes creatable again after the dwell).
+        for id in self.pending.clone() {
+            match self.trie.node(id).state {
+                CacheState::Pending { since_hours }
+                    if now - since_hours > self.cfg.pending_timeout_hours =>
+                {
+                    let n = self.trie.node_mut(id);
+                    n.state = CacheState::Uncached;
+                    n.last_flip = now;
+                    self.pending.remove(&id);
+                }
+                CacheState::Pending { .. } => {}
+                _ => {
+                    self.pending.remove(&id);
+                }
+            }
+        }
         if let Some(tau_hold) = self.prices.tau_hold_hours() {
             self.retire_dominated(now, tau_hold, &mut actions);
             for id in self.cached.clone() {
@@ -388,10 +477,36 @@ impl Engine {
     }
 
     /// Tell the engine a provider-side action failed (e.g. create rejected):
-    /// reverts the node to uncached so the state model stays truthful.
-    pub fn mark_failed(&mut self, node: NodeId) {
-        self.trie.node_mut(node).state = CacheState::Uncached;
+    /// reverts the node to uncached so the state model stays truthful. The
+    /// dwell timer restarts, giving the provider a breather before a retry.
+    pub fn mark_failed(&mut self, node: NodeId, now: f64) {
+        let n = self.trie.node_mut(node);
+        n.state = CacheState::Uncached;
+        n.last_flip = now;
         self.cached.remove(&node);
+        self.pending.remove(&node);
+    }
+
+    /// Estimate the input-token cost of sending this request through this
+    /// engine's provider right now, given its live cache state — the quantity
+    /// cross-provider routing compares (DESIGN.md §3.4c). Read-only: does not
+    /// record a traversal.
+    pub fn quote_input_cost(&self, blocks: &[u64], total_tokens: u64, now: f64) -> f64 {
+        let path = self.trie.peek_path(blocks);
+        let mut cached = 0u64;
+        for &id in &path {
+            if let CacheState::Cached {
+                expires_at_hours, ..
+            } = self.trie.node(id).state
+            {
+                if expires_at_hours > now {
+                    cached = self.trie.tokens(id);
+                }
+            }
+        }
+        let cached = cached.min(total_tokens);
+        cached as f64 / 1e6 * self.prices.cached_read_per_mtok
+            + (total_tokens - cached) as f64 / 1e6 * self.prices.input_per_mtok
     }
 }
 
@@ -401,6 +516,15 @@ mod tests {
 
     fn prefix(n: u64) -> Vec<u64> {
         (0..n).map(|i| 0x1000 + i).collect()
+    }
+
+    /// Simulate an instantly-successful adapter: confirm every Create.
+    fn confirm_creates(eng: &mut Engine, actions: &[Action], now: f64) {
+        for a in actions {
+            if let Action::Create { node, .. } = a {
+                eng.confirm_create(*node, now);
+            }
+        }
     }
 
     #[test]
@@ -424,6 +548,7 @@ mod tests {
                     cached_reads += 1;
                     assert_eq!(obs.cached_tokens, 5120);
                 }
+                confirm_creates(&mut eng, &obs.actions, now);
             }
             eng.tick(now);
         }
@@ -443,7 +568,8 @@ mod tests {
         for m in 0..=120u32 {
             let now = m as f64 / 60.0;
             if m % 5 == 0 && m <= 45 {
-                eng.observe(&blocks, now);
+                let obs = eng.observe(&blocks, now);
+                confirm_creates(&mut eng, &obs.actions, now);
                 last_hit = now;
             }
             for a in eng.tick(now) {
@@ -468,7 +594,8 @@ mod tests {
         for m in 0..120u32 {
             let now = m as f64 / 60.0;
             if m % 5 == 0 {
-                eng.observe(&blocks, now);
+                let obs = eng.observe(&blocks, now);
+                confirm_creates(&mut eng, &obs.actions, now);
             }
             for a in eng.tick(now) {
                 match a {
@@ -510,6 +637,7 @@ mod tests {
                         _ => {}
                     }
                 }
+                confirm_creates(&mut eng, &obs.actions, now);
             }
             for a in eng.tick(now) {
                 if let Action::Delete { node } = a {
@@ -529,6 +657,78 @@ mod tests {
         let cached: Vec<_> = eng.cached_nodes().collect();
         assert_eq!(cached.len(), 1);
         assert_eq!(eng.trie().tokens(cached[0]), 9216);
+    }
+
+    #[test]
+    fn micro_batch_defers_followers_until_create_confirms() {
+        let cfg = Config {
+            enable_micro_batch: true,
+            ..Config::default()
+        };
+        let mut eng = Engine::new(PriceSheet::gemini_pro_like(), cfg);
+        let blocks = prefix(20);
+
+        // Warm until a create fires; the leader itself gets no defer.
+        let mut created = None;
+        let mut t = 0.0;
+        for i in 0..8 {
+            t = i as f64 * (5.0 / 60.0);
+            let obs = eng.observe(&blocks, t);
+            assert!(
+                obs.defer.is_none(),
+                "leader must not defer on its own write"
+            );
+            for a in &obs.actions {
+                if let Action::Create { node, .. } = a {
+                    created = Some(*node);
+                }
+            }
+            if created.is_some() {
+                break;
+            }
+        }
+        let node = created.expect("creation must fire");
+
+        // A follower 0.5s later sees the write in flight and is told to wait.
+        let obs = eng.observe(&blocks, t + 0.5 / 3600.0);
+        let defer = obs.defer.expect("follower must be deferred");
+        assert_eq!(defer.node, node);
+        assert!(obs.deepest_cached.is_none());
+        assert!(defer.until_hours > t && defer.until_hours <= t + 2.1 / 3600.0);
+
+        // The adapter confirms 1s after the create; the follower retries at
+        // the advised deadline and reads the cache.
+        eng.confirm_create(node, t + 1.0 / 3600.0);
+        let obs = eng.observe(&blocks, defer.until_hours);
+        assert!(obs.defer.is_none());
+        assert_eq!(obs.deepest_cached, Some(node));
+    }
+
+    #[test]
+    fn unconfirmed_create_times_out_and_retries_later() {
+        let mut eng = Engine::new(PriceSheet::gemini_pro_like(), Config::default());
+        let blocks = prefix(20);
+        let mut creates = 0;
+        // Never confirm: the adapter is "down". The engine must revert the
+        // pending node after the timeout and try again after the dwell.
+        for m in 0..=60u32 {
+            let now = m as f64 / 60.0;
+            if m % 5 == 0 {
+                let obs = eng.observe(&blocks, now);
+                creates += obs
+                    .actions
+                    .iter()
+                    .filter(|a| matches!(a, Action::Create { .. }))
+                    .count();
+            }
+            eng.tick(now);
+        }
+        assert!(creates >= 2, "creation must be retried, got {creates}");
+        assert_eq!(
+            eng.cached_nodes().count(),
+            0,
+            "nothing confirmed, nothing cached"
+        );
     }
 
     #[test]
