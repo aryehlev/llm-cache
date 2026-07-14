@@ -504,18 +504,46 @@ patentability search. See §8.
   2026-07-13: RadixAttention is arXiv:2312.07104; Preble is arXiv:2407.00023
   (ICLR 2025); Prompt Cache is arXiv:2311.04934.
 
-## 8. Future work
+## 8. Reference implementation and empirical results
 
+The `llm-cache` Rust crate implements this design (trie, two-regime value
+function, breakpoint DP, ski-rental controller, shaping, micro-batching,
+routing, provider adapters) as a zero-dependency library, plus a **simulation
+harness** (`sim` module + `pcoe-sim` binary) that replays traffic traces
+through PCOE, the naive baselines, and a perfect-hindsight offline oracle.
+
+**Measured results** (7-day synthetic traces, Gemini-Pro-like prices, via
+`pcoe-sim run --scenario …`) confirm the design where it was expected to win —
+and, importantly, mapped its limits:
+
+| Workload | vs no-cache | vs cache-everything | competitive ratio |
+|---|---|---|---|
+| business-day (idle nights) | **−69%** | −50% | 1.03× |
+| multi-tenant (12 staggered) | **−71%** | −46% | 1.12× |
+| bursty (bimodal hot/cold) | −76% | **+7% — loses** | 1.30× |
+
+The business-day −69% matches §4.1's hand-computed figure. The **bursty result
+is the key empirical finding**: PCOE's greedy per-gap ski-rental (§3.3) is
+myopic — during a cold lull whose gaps just exceed `τ_hold` it deletes the cache
+right before the next burst, and can lose to plain cache-everything. The offline
+oracle shows ~30% of headroom a burst-aware controller would recover. This
+motivates the top future-work item below and is pinned by a regression test.
+
+### Future work (in priority order set by the results above)
+
+- **Burst / seasonality prediction (highest value):** the bursty gap above is
+  pure predictor deficit. Detect bimodal gap structure and daily/weekly
+  periodicity on top of the EWMA, and either hold through a predicted-short lull
+  or pre-create just before a predicted burst (the "create at 8:59" idea). This
+  is the learning-augmented ski-rental of §3.3 with a real predictor, and the
+  sim already provides the oracle to measure progress against.
 - **Self-hosted tier:** the same trie + value function can drive eviction in a
   local KV-cache store (RAM → SSD), replacing `p_store` with hardware amortization —
   bridging PCOE to the LMCache/Mooncake layer with one cost model.
-- **Reference implementation:** Rust library (`llm-cache` crate): trie + controller
-  as a pure core, provider adapters behind a trait, proxy binary later.
-- **Simulation harness:** replay real (hashed) traffic traces through the
-  controller vs. oracle-offline-optimal to measure the empirical competitive ratio.
-- **Richer predictors:** periodicity detection (daily/weekly seasonality) on top of
-  the EWMA — the office-hours pattern in §4 is learnable, letting PCOE pre-create
-  the cache at 8:59 rather than paying one cold miss.
+- **Live HTTP adapters:** a companion crate wrapping the wire-agnostic `adapter`
+  layer with an async Gemini/Anthropic client and a proxy binary.
+- **Real-tokenizer chunking:** a `Chunker` impl over tiktoken/SentencePiece for
+  token-exact block boundaries (the byte approximation costs a little coverage).
 
 ## 9. Disclaimer
 

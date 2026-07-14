@@ -25,6 +25,10 @@ pub struct NodeStats {
     pub t_last: f64,
     /// Decayed traversal count (confidence proxy).
     pub samples: f64,
+    /// Raw (undecayed) traversal count — how many requests have ever passed
+    /// through this prefix. Distinguishes a shared prefix (count ≫ 1) from a
+    /// unique per-request suffix (count == 1).
+    pub raw_count: u64,
     /// Decayed inter-arrival gap histogram (see [`GAP_EDGES_HOURS`]).
     pub gap_mass: [f64; 3],
 }
@@ -35,6 +39,7 @@ impl NodeStats {
             lambda: 0.0,
             t_last: 0.0,
             samples: 0.0,
+            raw_count: 0,
             gap_mass: [0.0; 3],
         }
     }
@@ -42,6 +47,7 @@ impl NodeStats {
     /// Record a traversal at `now` with decay constant `tau` (hours). Decay is
     /// applied lazily — idle nodes cost nothing between traversals.
     fn observe(&mut self, now: f64, tau: f64) {
+        self.raw_count = self.raw_count.saturating_add(1);
         if self.samples == 0.0 {
             self.lambda = 1.0 / tau;
             self.samples = 1.0;

@@ -25,6 +25,7 @@ A zero-dependency Rust library implementing the PCOE core:
 | `router` | §3.4c | Cross-provider routing on cache-state-aware marginal input cost (read-only quotes that don't pollute traffic stats). |
 | `adapter` | §5 | Wire-agnostic Gemini (`cachedContents` create/patch/delete + handle registry) and Anthropic (`cache_control` breakpoint offsets + TTL labels) translation layers. |
 | `chunk` | §3.1 | `Chunker` trait for pluggable tokenizers, plus token-ID and byte-block hashing helpers. |
+| `trace` / `sim` | §8 | Traffic traces (privacy-safe: block hashes only) + a replay simulator that costs PCOE against every baseline and an offline oracle. |
 
 The engine is deterministic and clock-free (callers pass `now` in hours), talks to
 no provider directly (adapters translate actions into concrete API operations the
@@ -48,3 +49,68 @@ scenario end-to-end and checks the day cost lands near the doc's $11.84 figure:
 ```sh
 cargo test
 ```
+
+## Proving ROI: `pcoe-sim`
+
+The point of a cost optimizer is the dollar figure on *your* traffic, not a
+synthetic claim. `pcoe-sim` replays a traffic trace — a captured production one
+(privacy-safe: block hashes only, no prompt text) or a synthetic workload —
+through PCOE and every alternative, and prints what each would have spent,
+including an **offline oracle** (perfect-hindsight ski-rental) to bound how much
+headroom remains.
+
+```sh
+cargo run --bin pcoe-sim -- run --scenario business-day --days 7
+```
+
+```text
+  PCOE ROI report — scenario business-day (7 days, seed 42)
+  provider: gemini (storage-metered)   requests: 670
+
+  policy                         cost ($)    vs no-$  hit rate ops(c/e/d)
+  ----------------------------------------------------------------------
+  no caching                       268.60          —        0%          —
+  cache-everything                 164.73       -39%      100%      1/0/0
+  static TTL (60m idle)             87.34       -67%       99%      7/0/6
+▶ PCOE                              82.04       -69%       95%   11/155/8
+  offline oracle                    79.32       -70%         —          —
+
+  PCOE vs no caching:       -69%   ($268.60 -> $82.04)
+  PCOE vs cache-everything: -50%   ($164.73 -> $82.04)
+  PCOE vs offline optimal:  1.03x  (1.00x = perfect hindsight)
+```
+
+Capture a trace from production and replay it:
+
+```sh
+pcoe-sim gen multi-tenant --days 7 --out fleet.trace   # or write your own
+pcoe-sim run --trace fleet.trace
+```
+
+### Where it helps — and where it doesn't (measured, not claimed)
+
+The simulator is honest about PCOE's envelope. Over a 7-day run at Gemini-Pro-like
+prices:
+
+| Workload | PCOE vs no-cache | PCOE vs cache-everything | vs offline optimal |
+|---|---|---|---|
+| **business-day** (one big prefix, nightly idle) | **−69%** | −50% | 1.03× |
+| **multi-tenant** (12 staggered tenants) | **−71%** | −46% | 1.12× |
+| **bursty** (bimodal hot/cold) | −76% | **+7% (loses)** | 1.30× |
+
+- **Strong win** where a big prefix goes idle (nights, weekends) or where many
+  tenants have their own hours — cases no single hand-set TTL covers. This is the
+  product's core: Gemini storage-metered caching across many tenants.
+- **Competitive** with a *well-tuned* static TTL on clean single-prefix traffic;
+  PCOE edges it out over enough days but the margin is small.
+- **Loses to plain cache-everything on bimodal bursty traffic** — PCOE's greedy
+  per-gap ski-rental deletes during a cold lull right before the next burst. The
+  offline oracle shows ~30% headroom a burst-*predicting* controller would
+  recover; that predictor is the top item in DESIGN.md §8 future work. The
+  `bursty_bimodal_exposes_greedy_ski_rental_myopia` test pins this limitation so
+  it can't regress silently.
+
+**Decision rule:** worth deploying if you spend enough on LLM input tokens that a
+large shared prefix sits idle for meaningful stretches, or you manage many tenants
+— especially on Gemini. The loss is bounded (worst case 2× the offline optimum,
+never a wrong answer), so it's safe to A/B against your current setup.

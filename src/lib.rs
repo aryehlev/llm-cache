@@ -41,6 +41,8 @@ pub mod plan;
 pub mod price;
 pub mod router;
 pub mod shape;
+pub mod sim;
+pub mod trace;
 pub mod trie;
 
 pub use chunk::{ByteChunker, Chunker};
@@ -49,4 +51,6 @@ pub use plan::Placement;
 pub use price::{PriceSheet, Regime, TtlTier};
 pub use router::{cheapest_route, RouteCandidate};
 pub use shape::{stable_boundary, ShapeHint};
+pub use sim::{compare, replay, Comparison, Policy, Report};
+pub use trace::Event;
 pub use trie::{CacheState, NodeId, PrefixTrie};
