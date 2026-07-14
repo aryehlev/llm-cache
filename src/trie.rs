@@ -149,9 +149,48 @@ pub struct Node {
     /// through them without changing the common case (DESIGN.md §3.3).
     pub hold_hint: f64,
     /// Time the last cache for this prefix was deleted, hours
-    /// (`NEG_INFINITY` if never). Used to detect a premature delete.
+    /// (`NEG_INFINITY` if never). Used to detect a premature delete and to
+    /// predict the next periodic return.
     pub last_delete: f64,
+    /// True between a delete and the next request — the window in which we
+    /// measure the return gap that feeds the periodicity predictor.
+    pub awaiting_return: bool,
+    /// EWMA of observed post-delete return gaps, hours (0 = none). With
+    /// [`Self::ret_gap_sq`] and [`Self::ret_n`] this is the periodicity model:
+    /// a prefix that reliably comes back after ~the same idle (a daily open)
+    /// can be pre-created just before it (DESIGN.md §3.3, predictive hold).
+    pub ret_gap: f64,
+    /// EWMA of the squared return gap (for the consistency / variance test).
+    pub ret_gap_sq: f64,
+    /// Number of return gaps observed (predictor confidence).
+    pub ret_n: u32,
     alive: bool,
+}
+
+impl Node {
+    /// Predicted return period and its coefficient of variation, if enough
+    /// consistent returns have been seen (`ret_n ≥ min_returns`). Returns
+    /// `(period_hours, cv)`; a small `cv` means a reliable period.
+    pub fn return_prediction(&self, min_returns: u32) -> Option<(f64, f64)> {
+        if self.ret_n < min_returns || self.ret_gap <= 0.0 {
+            return None;
+        }
+        let var = (self.ret_gap_sq - self.ret_gap * self.ret_gap).max(0.0);
+        Some((self.ret_gap, var.sqrt() / self.ret_gap))
+    }
+
+    /// Fold a freshly-observed return gap into the periodicity model.
+    pub(crate) fn record_return_gap(&mut self, gap: f64) {
+        const ALPHA: f64 = 0.34;
+        if self.ret_n == 0 {
+            self.ret_gap = gap;
+            self.ret_gap_sq = gap * gap;
+        } else {
+            self.ret_gap = (1.0 - ALPHA) * self.ret_gap + ALPHA * gap;
+            self.ret_gap_sq = (1.0 - ALPHA) * self.ret_gap_sq + ALPHA * gap * gap;
+        }
+        self.ret_n = self.ret_n.saturating_add(1);
+    }
 }
 
 /// The decayed prefix trie (arena-allocated).
@@ -184,6 +223,10 @@ impl PrefixTrie {
             last_flip: f64::NEG_INFINITY,
             hold_hint: 0.0,
             last_delete: f64::NEG_INFINITY,
+            awaiting_return: false,
+            ret_gap: 0.0,
+            ret_gap_sq: 0.0,
+            ret_n: 0,
             alive: true,
         };
         PrefixTrie {
@@ -230,6 +273,10 @@ impl PrefixTrie {
                         last_flip: f64::NEG_INFINITY,
                         hold_hint: 0.0,
                         last_delete: f64::NEG_INFINITY,
+                        awaiting_return: false,
+                        ret_gap: 0.0,
+                        ret_gap_sq: 0.0,
+                        ret_n: 0,
                         alive: true,
                     };
                     let id = match self.free.pop() {
@@ -252,6 +299,15 @@ impl PrefixTrie {
             cur = next;
         }
         path
+    }
+
+    /// Live nodes currently awaiting a return after a delete — the candidate
+    /// set for predictive pre-creation. Cheap to scan at tick cadence, and
+    /// always consistent (unlike an external index it can't hold freed ids).
+    pub fn awaiting_return_nodes(&self) -> Vec<NodeId> {
+        (0..self.nodes.len())
+            .filter(|&i| self.nodes[i].alive && self.nodes[i].awaiting_return)
+            .collect()
     }
 
     /// Read-only path lookup: walk `blocks` from the root without recording a

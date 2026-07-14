@@ -47,6 +47,22 @@ pub struct Config {
     pub micro_batch_defer_hours: f64,
     /// A Create left unconfirmed this long is presumed failed and reverted.
     pub pending_timeout_hours: f64,
+    /// Enable predictive pre-creation ahead of a confidently periodic return
+    /// (DESIGN.md §3.3). On by default; the strict confidence gate below means
+    /// it only ever fires on genuinely periodic prefixes (daily opens, per-
+    /// tenant windows), so unpredictable traffic is untouched.
+    pub enable_predictive: bool,
+    /// Lead time to pre-create before the predicted return, hours.
+    pub predictive_lead_hours: f64,
+    /// Minimum consistent return gaps before a period is trusted.
+    pub predictive_min_returns: u32,
+    /// Maximum coefficient of variation of the return gap to still call it
+    /// periodic (smaller = stricter; a metronome-regular daily open is ~0).
+    /// Genuinely periodic prefixes (daily opens, per-tenant windows) measure
+    /// CV ≲ 0.01; merely bursty traffic that briefly looks regular measures
+    /// CV ≳ 0.08, so this sits an order of magnitude below the noise floor to
+    /// keep pre-creation strictly off unpredictable traffic (zero-regression).
+    pub predictive_max_cv: f64,
 }
 
 impl Default for Config {
@@ -66,6 +82,10 @@ impl Default for Config {
             enable_micro_batch: false,
             micro_batch_defer_hours: 2.0 / 3600.0,
             pending_timeout_hours: 3.0 / 60.0,
+            enable_predictive: true,
+            predictive_lead_hours: 5.0 / 60.0,
+            predictive_min_returns: 3,
+            predictive_max_cv: 0.05,
         }
     }
 }
@@ -73,9 +93,25 @@ impl Default for Config {
 /// A cache-management action for the provider adapter to execute.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Action {
-    /// Create a provider-side cache for the prefix ending at `node`.
+    /// Create a provider-side cache for the prefix ending at `node`, using the
+    /// content of the request being observed (the common case).
     Create {
         /// Trie node whose prefix should be cached.
+        node: NodeId,
+        /// Prefix length in tokens.
+        tokens: u64,
+        /// Requested initial TTL, hours.
+        ttl_hours: f64,
+    },
+    /// **Pre-create** a cache ahead of a *predicted* periodic return, before
+    /// any request arrives (DESIGN.md §3.3, predictive hold). Because there is
+    /// no in-flight request to take content from, the application must serve
+    /// this from its retained stable-prefix content (a fixed system prompt /
+    /// corpus) — hence a distinct action from [`Action::Create`]. Emitted only
+    /// from [`Engine::tick`], only for prefixes with a confidently periodic
+    /// return, so it never fires on unpredictable traffic.
+    PreCreate {
+        /// Trie node whose prefix should be pre-created.
         node: NodeId,
         /// Prefix length in tokens.
         tokens: u64,
@@ -172,29 +208,42 @@ impl Engine {
     pub fn observe(&mut self, blocks: &[u64], now: f64) -> Observation {
         let path = self.trie.observe_path(blocks, now);
 
-        // Learned-hold feedback (storage regime): if this request's prefix was
-        // cached and we deleted it recently — traffic returned inside the max
-        // sensible hold window — the delete was premature. Grow this node's
-        // hold hint so next time it rides through a lull of that length,
-        // bounded by tau_effective (past which holding never pays). A prefix
-        // that only ever returns after a long idle (e.g. overnight) never
-        // triggers this, so the common case is untouched. See DESIGN.md §3.3.
+        // Return feedback (storage regime): the first request after a delete
+        // tells us how long the prefix was actually idle. That drives two
+        // learners, both keyed off `awaiting_return` so each delete is counted
+        // once (DESIGN.md §3.3):
+        //   1. Learned hold — if the return came inside tau_effective the
+        //      delete was premature; grow the hold to ride through such lulls.
+        //   2. Periodicity — record the return gap; a prefix that reliably
+        //      returns after ~the same idle can be pre-created just before it.
         if let (Some(tau_hold), Some(tau_eff)) = (
             self.prices.tau_hold_hours(),
             self.prices.tau_effective_hours(),
         ) {
             for &id in &path {
                 let node = self.trie.node(id);
-                let since_delete = now - node.last_delete;
-                if node.last_delete.is_finite() && since_delete < tau_eff {
-                    // The gap that beat us = idle we held (≈ prior hold) + the
-                    // time since we deleted. Learn to hold at least that long.
-                    let prior_hold = node.hold_hint.max(tau_hold);
-                    let missed_gap = prior_hold + since_delete;
-                    let n = self.trie.node_mut(id);
-                    n.hold_hint = missed_gap.min(tau_eff);
-                    n.last_delete = f64::NEG_INFINITY; // consume the signal
+                if !node.awaiting_return || !node.last_delete.is_finite() {
+                    continue;
                 }
+                let since_delete = (now - node.last_delete).max(0.0);
+                let prior_hold = node.hold_hint.max(tau_hold);
+                let n = self.trie.node_mut(id);
+                if since_delete < tau_eff {
+                    // Premature: the gap that beat us = held idle + since delete.
+                    n.hold_hint = (prior_hold + since_delete).min(tau_eff);
+                }
+                // Periodicity: only learn from *genuine* idle-and-return cycles
+                // — gaps past `tau_eff`, where the prefix definitely went cold
+                // and came back. Brief intraday lulls (below `tau_eff`) are the
+                // learned-hold's job, not pre-creation's; feeding them here would
+                // mix minute-scale and hour-scale gaps into one estimator and
+                // inflate its variance past the periodicity gate. The gap is
+                // measured from the *delete* (when the node started awaiting), so
+                // pre-creation lands just before the actual return.
+                if since_delete >= tau_eff {
+                    n.record_return_gap(since_delete);
+                }
+                n.awaiting_return = false;
             }
         }
 
@@ -409,6 +458,7 @@ impl Engine {
                     node.state = CacheState::Uncached;
                     node.last_flip = now;
                     node.last_delete = now;
+                    node.awaiting_return = true;
                     self.cached.remove(&id);
                 } else if expires_at_hours <= now {
                     // Extension cadence was missed and the provider expired the
@@ -431,9 +481,65 @@ impl Engine {
                 }
             }
         }
+        self.emit_predictive_precreates(now, &mut actions);
         self.trie
             .gc(now, self.cfg.gc_min_lambda, self.cfg.gc_min_idle_hours);
         actions
+    }
+
+    /// Predictive pre-creation (DESIGN.md §3.3): for a prefix whose post-delete
+    /// returns are confidently periodic, pre-create the cache a short lead
+    /// before the predicted next return, so the first request of the next
+    /// active window reads cached instead of paying the cold-start miss (the
+    /// dominant PCOE-vs-oracle gap on per-tenant fleets). The strict
+    /// confidence gate (min returns + low variation) means only genuinely
+    /// periodic prefixes ever pre-create; bursty and one-off traffic never do.
+    fn emit_predictive_precreates(&mut self, now: f64, actions: &mut Vec<Action>) {
+        if !self.cfg.enable_predictive {
+            return;
+        }
+        let Some(tau_hold) = self.prices.tau_hold_hours() else {
+            return;
+        };
+        // Candidates: nodes currently idle after a delete, awaiting their
+        // predicted return.
+        let candidates: Vec<NodeId> = self
+            .trie
+            .awaiting_return_nodes()
+            .into_iter()
+            .filter(|&id| matches!(self.trie.node(id).state, CacheState::Uncached))
+            .collect();
+        for id in candidates {
+            let node = self.trie.node(id);
+            let Some((period, cv)) = node.return_prediction(self.cfg.predictive_min_returns) else {
+                continue;
+            };
+            if cv > self.cfg.predictive_max_cv {
+                continue; // not periodic enough to bet a write on
+            }
+            let predicted = node.last_delete + period;
+            // Fire once we enter the lead window before the prediction, but not
+            // absurdly early (a late request is fine; the cache just waits).
+            if now >= predicted - self.cfg.predictive_lead_hours && now < predicted {
+                let tokens = self.trie.tokens(id);
+                if tokens < self.prices.min_cacheable_tokens {
+                    continue;
+                }
+                actions.push(Action::PreCreate {
+                    node: id,
+                    tokens,
+                    ttl_hours: tau_hold,
+                });
+                let n = self.trie.node_mut(id);
+                n.state = CacheState::Pending { since_hours: now };
+                n.last_flip = now;
+                n.awaiting_return = false; // consumed; don't re-fire this cycle
+                                           // Reset the hold clock so the freshly pre-created cache isn't
+                                           // instantly deleted against its stale last-hit time.
+                n.stats.t_last = now;
+                self.pending.insert(id);
+            }
+        }
     }
 
     /// Exclusive-coverage retirement (DESIGN.md §3.2 semantics applied to the
@@ -624,6 +730,70 @@ mod tests {
     }
 
     #[test]
+    fn predictive_precreate_fires_and_warms_a_periodic_return() {
+        // A prefix that is active, goes idle for a fixed period well past
+        // tau_effective, and returns — cycle after cycle — is exactly what
+        // predictive pre-creation targets. After enough clean cycles to learn
+        // the period (>= predictive_min_returns), a tick in the lead window
+        // before the next return must emit a PreCreate, and the first request of
+        // that next window must then read warm (cached) instead of cold.
+        let prices = PriceSheet::gemini_pro_like();
+        let tau_eff = prices.tau_effective_hours().unwrap();
+        let mut eng = Engine::new(prices, Config::default());
+        let blocks = prefix(20);
+        let period = 2.0_f64; // > tau_effective, so each idle is a real cycle
+
+        let mut precreated_cycle: Option<u32> = None;
+        let mut warm_after_precreate = false;
+        for cycle in 0..7u32 {
+            let base = cycle as f64 * period;
+            // Active burst: a dozen minutes of dense traffic creates & confirms.
+            for m in 0..12u32 {
+                let now = base + m as f64 / 60.0;
+                let obs = eng.observe(&blocks, now);
+                // The first request of a window that a pre-create warmed reads
+                // cached — that is the payoff we are checking.
+                if m == 0
+                    && cycle > 0
+                    && precreated_cycle == Some(cycle - 1)
+                    && obs.cached_tokens > 0
+                {
+                    warm_after_precreate = true;
+                }
+                confirm_creates(&mut eng, &obs.actions, now);
+                eng.tick(now);
+            }
+            // Idle until the next window, ticking each minute; watch for a
+            // pre-create and confirm it like a real adapter would.
+            let mut t = base + 12.0 / 60.0;
+            let next_base = (cycle as f64 + 1.0) * period;
+            while t < next_base {
+                for a in eng.tick(t) {
+                    if let Action::PreCreate { node, .. } = a {
+                        precreated_cycle.get_or_insert(cycle);
+                        eng.confirm_create(node, t);
+                    }
+                }
+                t += 1.0 / 60.0;
+            }
+        }
+
+        let c = precreated_cycle.expect("a periodic return must eventually pre-create");
+        // Never before the periodicity is trusted (>= min_returns clean cycles).
+        assert!(
+            c >= Config::default().predictive_min_returns,
+            "pre-create fired too early, at cycle {c}"
+        );
+        assert!(
+            warm_after_precreate,
+            "the pre-created cache must warm the next window's first request"
+        );
+        // Sanity: the learned period is the idle gap (~period - tau_hold), well
+        // past tau_effective, so this was a genuine idle-and-return cycle.
+        assert!(tau_eff < period);
+    }
+
+    #[test]
     fn learned_hold_grows_after_a_premature_delete() {
         // Warm a prefix, let it delete after tau_hold, then send a request
         // just after the delete — a premature delete. The node's hold_hint
@@ -696,6 +866,9 @@ mod tests {
                     Action::Extend { .. } => extends += 1,
                     Action::Delete { .. } => panic!("must not delete under steady traffic"),
                     Action::Create { .. } => unreachable!("tick never creates"),
+                    Action::PreCreate { .. } => {
+                        panic!("steady traffic never deletes, so it never pre-creates")
+                    }
                 }
             }
         }

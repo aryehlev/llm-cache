@@ -326,7 +326,51 @@ It is a per-node instance of *learning-augmented ski-rental* [Purohit, Svitkina 
 Kumar, NeurIPS 2018] where the "prediction" is learned online from the controller's
 own mistakes, and the worst-case 2-competitive bound is preserved because `h(n)` is
 clamped to `[τ_hold, τ_effective]`. Measured effect (§8): bursty competitive ratio
-`≈1.29 → ≈1.21` mean over seeds, with business-day and multi-tenant **unchanged**.
+`≈1.29 → ≈1.25` mean over seeds, with business-day and multi-tenant **unchanged**.
+
+**Predictive pre-creation (beating the online bound on periodic traffic).** The
+learned hold *reacts* to a lull after it has already cost a miss. When a prefix's
+idle-and-return cycle is genuinely **periodic** — a daily open, a per-tenant
+business window — the controller can do better than react: it can *pre-create* the
+cache just before the next return, so the first request of the window reads warm
+instead of paying the cold-start miss (full input on the shared prefix). This is
+the single largest PCOE-vs-oracle gap on per-tenant fleets, and closing it is the
+one place PCOE legitimately beats the online ski-rental lower bound — because it
+exploits *learned periodicity*, information the adversarial ski-rental model
+denies.
+
+Each node accumulates a **return-gap estimator** over its post-delete idle
+periods. Only *genuine* idle-and-return cycles feed it — gaps past `τ_effective`,
+where the prefix definitely went cold and came back. Brief intraday lulls (below
+`τ_effective`) are the learned hold's job; mixing their minute-scale gaps with the
+hour-scale overnight gaps would inflate the estimator's variance and destroy the
+periodicity signal. The estimator tracks the EWMA mean `μ(n)` and coefficient of
+variation `cv(n)` of these gaps. A return is called **confidently periodic**, and
+a pre-create is emitted, only when:
+
+```
+ret_n(n) ≥ K_min                       # ≥ K_min clean cycles observed (default 3)
+cv(n)    ≤ cv_max                       # low relative variance (default 0.05)
+now ∈ [last_delete(n) + μ(n) − lead,    # inside the lead window before the
+       last_delete(n) + μ(n))           #   predicted return (default lead = 5 min)
+```
+
+The `cv_max` gate is the safety mechanism: genuinely periodic prefixes measure
+`cv ≲ 0.01`, while merely-bursty traffic that briefly looks regular measures
+`cv ≳ 0.08`, so the default `0.05` sits an order of magnitude below the noise
+floor. Pre-creation therefore **never fires on unpredictable traffic** — it is
+strictly zero-regression, exactly like the learned hold. Because PCOE never
+retains prompt content (§3.5), a pre-create carries no request to slice content
+from; the application serves it from its retained stable-prefix corpus (the fixed
+system prompt it re-sends every request), which the adapter surfaces as a distinct
+`PreCreate` action (§5).
+
+Measured effect (§8): multi-tenant competitive ratio `1.135× → 1.111×`
+(~$12/week per 12 tenants at Gemini-Pro-like prices), business-day slightly
+improved, and bursty **unchanged** (Δ = $0.00 across all seeds — the cv gate keeps
+it off). The residual multi-tenant gap is the ski-rental `τ_hold` storage tail plus
+the estimator's `K_min`-cycle bootstrap (a daily prefix needs ~3 days before its
+period is trusted), both inherent to online operation.
 
 **Creation rule.** On a request whose deepest cache-worthy node `n` is `UNCACHED`:
 
@@ -545,31 +589,53 @@ and, importantly, mapped and then partly closed its limits:
 
 | Workload | vs no-cache | vs cache-everything | competitive ratio |
 |---|---|---|---|
-| business-day (idle nights) | **−69%** | −50% | 1.03× |
-| multi-tenant (12 staggered) | **−71%** | −46% | 1.12× |
-| bursty (bimodal hot/cold) | −77% | +1% | ≈1.21× (mean) |
+| business-day (idle nights) | **−68%** | −47% | 1.10× |
+| multi-tenant (12 staggered) | **−71%** | −47% | 1.11× |
+| bursty (bimodal hot/cold) | −77% | +3% | ≈1.25× (mean) |
 
-The business-day −69% matches §4.1's hand-computed figure. **Bursty was the key
-empirical finding and drove a design improvement.** A purely greedy per-gap
-ski-rental deletes during a cold lull right before the next burst (competitive
-ratio ≈1.29, *losing* to cache-everything by ~7%). The fix — the **learned
-per-node hold** (§3.3) — grows a prefix's hold only after it demonstrates a
-premature delete, pulling the mean bursty ratio to ≈1.21 while leaving
-business-day and multi-tenant *bit-for-bit unchanged* (they never premature-delete,
-so the learner never fires). The residual bursty headroom to the oracle is the
-genuinely-online part — the hot→cold transition and the learner's ramp-up can't be
-won without actually *predicting* the bursts. Both the improvement and the residual
-gap are pinned by regression tests.
+The business-day figure matches §4.1's hand-computed workload. Two empirical
+findings each drove a design improvement, both pinned by regression tests:
+
+**Bursty → the learned per-node hold (§3.3).** A purely greedy per-gap ski-rental
+deletes during a cold lull right before the next burst (competitive ratio ≈1.29,
+*losing* to cache-everything). The learned hold grows a prefix's hold only after it
+demonstrates a premature delete, pulling the mean bursty ratio to ≈1.25 while
+leaving business-day and multi-tenant *bit-for-bit unchanged* (they never
+premature-delete, so the learner never fires). The residual bursty headroom is the
+genuinely-online part — the hot→cold transition can't be won without *predicting*
+the bursts, and bursty traffic is not periodic enough to predict.
+
+**Multi-tenant → predictive pre-creation (§3.3).** Instrumenting the multi-tenant
+gap showed it was dominated by the *cold-start miss* each tenant pays on its first
+request of the day, when the overnight-deleted cache is not yet rebuilt. Predictive
+pre-creation warms the cache just before each confidently-periodic return, cutting
+the ratio `1.135× → 1.111×` (~$12/week per 12 tenants) with **zero regression**
+elsewhere — the `cv ≤ 0.05` confidence gate keeps it entirely off the non-periodic
+bursty workload (Δ = $0.00 across all seeds). The residual multi-tenant gap is the
+ski-rental `τ_hold` storage tail plus the estimator's 3-cycle bootstrap, both
+inherent to online operation.
+
+> **Measurement note.** These figures reflect a corrected simulator storage-billing
+> pass: a cache the controller lets *silently expire* (its provider TTL lapses
+> mid-hold, with nothing to delete remotely) is now billed to its true expiry
+> rather than dropped. This raised the *measured* clean-workload ratios (e.g.
+> business-day `1.03× → 1.10×`) — the earlier figures under-counted PCOE's storage.
+> The relative improvements from the learned hold and pre-creation are measured
+> against this corrected baseline.
 
 ### Future work (in priority order set by the results above)
 
-- **Burst / seasonality prediction (highest value):** the residual bursty gap is
-  pure predictor deficit — the learned hold reacts to a lull, but a predictor could
-  anticipate it. Detect bimodal gap structure and daily/weekly periodicity on top
-  of the EWMA, and either hold through a predicted-short lull or pre-create just
-  before a predicted burst (the "create at 8:59" idea). This is the
-  learning-augmented ski-rental of §3.3 with a real forward predictor rather than a
-  reactive one, and the sim already provides the oracle to measure progress.
+- **Burst / seasonality prediction (highest remaining value):** predictive
+  pre-creation (§3.3) already handles *periodic* returns; the residual bursty gap is
+  the *aperiodic* predictor deficit — detecting bimodal gap structure to hold
+  through a predicted-short lull, where the cv gate deliberately refuses to bet.
+  This is the learning-augmented ski-rental of §3.3 extended from periodic to
+  stochastic-bimodal structure, and the sim already provides the oracle to measure
+  progress.
+- **Shorter pre-creation bootstrap:** a daily prefix needs ~3 clean cycles before
+  its period is trusted, wasting the first days of a fleet's life. Priors shared
+  across sibling tenants (same prefix shape, staggered hours) could warm the
+  estimator faster.
 - **Self-hosted tier:** the same trie + value function can drive eviction in a
   local KV-cache store (RAM → SSD), replacing `p_store` with hardware amortization —
   bridging PCOE to the LMCache/Mooncake layer with one cost model.

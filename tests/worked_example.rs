@@ -41,7 +41,10 @@ fn business_day_costs_match_design_doc() {
                          storage_open: &mut Option<(f64, u64)>,
                          delete_time: &mut Option<f64>| {
         match *a {
-            Action::Create { tokens, .. } => {
+            // A pre-create has the same cost shape as a request-driven create
+            // (write once, then storage runs); it just fires ahead of a
+            // predicted return rather than on an in-flight request.
+            Action::Create { tokens, .. } | Action::PreCreate { tokens, .. } => {
                 *creates += 1;
                 *cost += tokens as f64 / 1e6 * p_in; // creation bills tokens once
                 *storage_open = Some((now, tokens));

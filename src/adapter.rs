@@ -33,6 +33,19 @@ pub mod gemini {
             /// Requested TTL, seconds.
             ttl_seconds: u64,
         },
+        /// `cachedContents.create` **ahead of a predicted return** — there is no
+        /// in-flight request, so the application must build the `CachedContent`
+        /// from its **retained stable-prefix content** (the fixed system prompt
+        /// / corpus it re-sends every request), not from a request slice. Same
+        /// success/failure callbacks as [`GeminiCall::CreateCachedContent`].
+        PreCreateCachedContent {
+            /// Engine node this cache corresponds to.
+            node: NodeId,
+            /// How many leading tokens of the stored prefix to cache.
+            prefix_tokens: u64,
+            /// Requested TTL, seconds.
+            ttl_seconds: u64,
+        },
         /// `cachedContents.patch`: push the entry's expiry out.
         UpdateExpiry {
             /// Engine node.
@@ -94,6 +107,15 @@ pub mod gemini {
                         tokens,
                         ttl_hours,
                     } => calls.push(GeminiCall::CreateCachedContent {
+                        node,
+                        prefix_tokens: tokens,
+                        ttl_seconds: (ttl_hours * 3600.0).ceil() as u64,
+                    }),
+                    Action::PreCreate {
+                        node,
+                        tokens,
+                        ttl_hours,
+                    } => calls.push(GeminiCall::PreCreateCachedContent {
                         node,
                         prefix_tokens: tokens,
                         ttl_seconds: (ttl_hours * 3600.0).ceil() as u64,
