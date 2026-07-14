@@ -142,6 +142,15 @@ pub struct Node {
     pub state: CacheState,
     /// Last time `state` flipped (for hysteresis dwell).
     pub last_flip: f64,
+    /// Learned idle-hold time for this prefix, hours (0 = use the default
+    /// `tau_hold`). Grown when a delete turns out to have been premature —
+    /// traffic returned right after we let the cache go — and decayed back
+    /// toward the default otherwise. Lets a prefix with recurring lulls hold
+    /// through them without changing the common case (DESIGN.md §3.3).
+    pub hold_hint: f64,
+    /// Time the last cache for this prefix was deleted, hours
+    /// (`NEG_INFINITY` if never). Used to detect a premature delete.
+    pub last_delete: f64,
     alive: bool,
 }
 
@@ -173,6 +182,8 @@ impl PrefixTrie {
             stats: NodeStats::new(),
             state: CacheState::Uncached,
             last_flip: f64::NEG_INFINITY,
+            hold_hint: 0.0,
+            last_delete: f64::NEG_INFINITY,
             alive: true,
         };
         PrefixTrie {
@@ -217,6 +228,8 @@ impl PrefixTrie {
                         stats: NodeStats::new(),
                         state: CacheState::Uncached,
                         last_flip: f64::NEG_INFINITY,
+                        hold_hint: 0.0,
+                        last_delete: f64::NEG_INFINITY,
                         alive: true,
                     };
                     let id = match self.free.pop() {

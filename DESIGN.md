@@ -285,21 +285,48 @@ arrival sequence [Karlin et al., *Competitive snoopy caching*, Algorithmica 1988
 The randomized variant (delete at a random time drawn from the exponential-tilted
 distribution over `[0, τ_hold]`) improves the bound to `e/(e−1) ≈ 1.58`.
 
-**Rate-informed override.** When `λ̂(n)` is confident (decayed sample count above a
-floor), switch from worst-case to expected-value: hold iff the expected next-hit
-time `1/λ̂(n)` satisfies
+**The buy cost is recreation *plus a miss*.** The naive ski-rental above prices
+"going cold" at recreation alone (`p_in`). But when demand returns to a deleted
+cache, the returning request *also* pays a miss — full input `p_in` instead of the
+cached `p_read`. So the true buy cost is `2·p_in − p_read`, and holding can be
+worth it up to
 
 ```
-hold  iff  E[storage until next hit] < P(hit before abandon) · recreation savings
-       ⟺  p_store / λ̂(n) < p_in − p_read·(...)      (simplified: 1/λ̂ < τ_hold)
+τ_effective = (2·p_in − p_read) / p_store        (still cache-size-independent)
 ```
 
-i.e. hold while the expected gap is shorter than `τ_hold`, delete immediately when
-the estimated regime says the next hit will arrive after break-even anyway. The
-worst-case rule remains a fallback whenever the estimator is cold — so the
-2-competitive guarantee is never lost, only improved upon. (This
-predictor-plus-worst-case-fallback structure follows the *learning-augmented
-ski-rental* line of work [Purohit, Svitkina & Kumar, NeurIPS 2018].)
+which is strictly longer than `τ_hold = p_in / p_store`. The catch, found
+empirically with the §8 simulator: **holding every idle cache to `τ_effective`
+helps bursty traffic but *wastes* storage on clean-idle workloads** (a prefix that
+goes quiet at 5 pm and returns at 9 am gains nothing from the extra hold). A single
+global threshold is wrong for both regimes.
+
+**Learned per-node hold (the resolution).** Instead of a global threshold, each
+node keeps a **learned hold** `h(n)`, defaulting to `τ_hold`. The delete rule uses
+`h(n)`; on delete, the delete time is recorded. If a request for that prefix
+arrives again *within `τ_effective` of the delete* — demand returned almost
+immediately, so the delete was **premature** — `h(n)` is grown to cover the gap we
+just missed, bounded by `τ_effective`:
+
+```
+on delete(n):            record last_delete(n) = now
+on request to n, if (now − last_delete(n)) < τ_effective:   # premature
+    h(n) ← min(τ_effective, prior_hold + (now − last_delete(n)))
+```
+
+This is a direct, self-correcting feedback loop on the actual cost signal:
+
+- A prefix that only ever returns after a long idle (overnight, weekend) **never
+  triggers** the rule — `h(n)` stays `τ_hold`, so the common case is exactly the
+  worst-case-optimal greedy controller, **no regression**.
+- A prefix with recurring short lulls (a bursty cold phase) accumulates premature
+  deletes and grows `h(n)` toward `τ_effective`, riding through the lulls.
+
+It is a per-node instance of *learning-augmented ski-rental* [Purohit, Svitkina &
+Kumar, NeurIPS 2018] where the "prediction" is learned online from the controller's
+own mistakes, and the worst-case 2-competitive bound is preserved because `h(n)` is
+clamped to `[τ_hold, τ_effective]`. Measured effect (§8): bursty competitive ratio
+`≈1.29 → ≈1.21` mean over seeds, with business-day and multi-tenant **unchanged**.
 
 **Creation rule.** On a request whose deepest cache-worthy node `n` is `UNCACHED`:
 
@@ -514,29 +541,35 @@ through PCOE, the naive baselines, and a perfect-hindsight offline oracle.
 
 **Measured results** (7-day synthetic traces, Gemini-Pro-like prices, via
 `pcoe-sim run --scenario …`) confirm the design where it was expected to win —
-and, importantly, mapped its limits:
+and, importantly, mapped and then partly closed its limits:
 
 | Workload | vs no-cache | vs cache-everything | competitive ratio |
 |---|---|---|---|
 | business-day (idle nights) | **−69%** | −50% | 1.03× |
 | multi-tenant (12 staggered) | **−71%** | −46% | 1.12× |
-| bursty (bimodal hot/cold) | −76% | **+7% — loses** | 1.30× |
+| bursty (bimodal hot/cold) | −77% | +1% | ≈1.21× (mean) |
 
-The business-day −69% matches §4.1's hand-computed figure. The **bursty result
-is the key empirical finding**: PCOE's greedy per-gap ski-rental (§3.3) is
-myopic — during a cold lull whose gaps just exceed `τ_hold` it deletes the cache
-right before the next burst, and can lose to plain cache-everything. The offline
-oracle shows ~30% of headroom a burst-aware controller would recover. This
-motivates the top future-work item below and is pinned by a regression test.
+The business-day −69% matches §4.1's hand-computed figure. **Bursty was the key
+empirical finding and drove a design improvement.** A purely greedy per-gap
+ski-rental deletes during a cold lull right before the next burst (competitive
+ratio ≈1.29, *losing* to cache-everything by ~7%). The fix — the **learned
+per-node hold** (§3.3) — grows a prefix's hold only after it demonstrates a
+premature delete, pulling the mean bursty ratio to ≈1.21 while leaving
+business-day and multi-tenant *bit-for-bit unchanged* (they never premature-delete,
+so the learner never fires). The residual bursty headroom to the oracle is the
+genuinely-online part — the hot→cold transition and the learner's ramp-up can't be
+won without actually *predicting* the bursts. Both the improvement and the residual
+gap are pinned by regression tests.
 
 ### Future work (in priority order set by the results above)
 
-- **Burst / seasonality prediction (highest value):** the bursty gap above is
-  pure predictor deficit. Detect bimodal gap structure and daily/weekly
-  periodicity on top of the EWMA, and either hold through a predicted-short lull
-  or pre-create just before a predicted burst (the "create at 8:59" idea). This
-  is the learning-augmented ski-rental of §3.3 with a real predictor, and the
-  sim already provides the oracle to measure progress against.
+- **Burst / seasonality prediction (highest value):** the residual bursty gap is
+  pure predictor deficit — the learned hold reacts to a lull, but a predictor could
+  anticipate it. Detect bimodal gap structure and daily/weekly periodicity on top
+  of the EWMA, and either hold through a predicted-short lull or pre-create just
+  before a predicted burst (the "create at 8:59" idea). This is the
+  learning-augmented ski-rental of §3.3 with a real forward predictor rather than a
+  reactive one, and the sim already provides the oracle to measure progress.
 - **Self-hosted tier:** the same trie + value function can drive eviction in a
   local KV-cache store (RAM → SSD), replacing `p_store` with hardware amortization —
   bridging PCOE to the LMCache/Mooncake layer with one cost model.

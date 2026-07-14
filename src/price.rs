@@ -64,9 +64,24 @@ impl PriceSheet {
     /// The ski-rental hold time after the last hit, in hours (storage regime).
     ///
     /// `tau = p_in / p_store` — independent of cache size (DESIGN.md §3.3), with
-    /// the classical 2-competitive worst-case guarantee.
+    /// the classical 2-competitive worst-case guarantee. This is the default
+    /// and the floor: a cache is never deleted before this.
     pub fn tau_hold_hours(&self) -> Option<f64> {
         self.storage_per_mtok_hour.map(|s| self.input_per_mtok / s)
+    }
+
+    /// The upper bound on adaptive holding, in hours (storage regime).
+    ///
+    /// Losing a warm cache costs recreation (`p_in`) **and** a miss on the
+    /// request that finds it cold (`p_in − p_read` extra), so the true
+    /// ski-rental *buy* cost is `2·p_in − p_read` and holding can be worth it
+    /// up to `tau = (2·p_in − p_read) / p_store`. The controller only holds
+    /// this long for a node whose traffic has *demonstrated* it recurs after a
+    /// lull (see the learned per-node hold in the engine); the common case
+    /// stays at [`Self::tau_hold_hours`]. Still cache-size-independent.
+    pub fn tau_effective_hours(&self) -> Option<f64> {
+        self.storage_per_mtok_hour
+            .map(|s| (2.0 * self.input_per_mtok - self.cached_read_per_mtok) / s)
     }
 
     /// Gemini-Pro-like storage-metered sheet ($2.00 in / $0.20 cached read per
@@ -118,6 +133,16 @@ mod tests {
         assert!((tau - 2.0 / 4.5).abs() < 1e-12);
         // ~26.7 minutes at reported Gemini Pro prices.
         assert!((tau * 60.0 - 26.666).abs() < 0.1);
+    }
+
+    #[test]
+    fn tau_effective_includes_miss_and_exceeds_tau_hold() {
+        let p = PriceSheet::gemini_pro_like();
+        let eff = p.tau_effective_hours().unwrap();
+        // (2*2.00 - 0.20)/4.50 hours ≈ 50.7 minutes.
+        assert!((eff - (2.0 * 2.0 - 0.2) / 4.5).abs() < 1e-12);
+        assert!((eff * 60.0 - 50.666).abs() < 0.1);
+        assert!(eff > p.tau_hold_hours().unwrap());
     }
 
     #[test]

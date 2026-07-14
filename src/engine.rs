@@ -172,6 +172,32 @@ impl Engine {
     pub fn observe(&mut self, blocks: &[u64], now: f64) -> Observation {
         let path = self.trie.observe_path(blocks, now);
 
+        // Learned-hold feedback (storage regime): if this request's prefix was
+        // cached and we deleted it recently — traffic returned inside the max
+        // sensible hold window — the delete was premature. Grow this node's
+        // hold hint so next time it rides through a lull of that length,
+        // bounded by tau_effective (past which holding never pays). A prefix
+        // that only ever returns after a long idle (e.g. overnight) never
+        // triggers this, so the common case is untouched. See DESIGN.md §3.3.
+        if let (Some(tau_hold), Some(tau_eff)) = (
+            self.prices.tau_hold_hours(),
+            self.prices.tau_effective_hours(),
+        ) {
+            for &id in &path {
+                let node = self.trie.node(id);
+                let since_delete = now - node.last_delete;
+                if node.last_delete.is_finite() && since_delete < tau_eff {
+                    // The gap that beat us = idle we held (≈ prior hold) + the
+                    // time since we deleted. Learn to hold at least that long.
+                    let prior_hold = node.hold_hint.max(tau_hold);
+                    let missed_gap = prior_hold + since_delete;
+                    let n = self.trie.node_mut(id);
+                    n.hold_hint = missed_gap.min(tau_eff);
+                    n.last_delete = f64::NEG_INFINITY; // consume the signal
+                }
+            }
+        }
+
         // Deepest live cached node; lazily clear entries the provider has
         // already expired.
         let mut deepest_cached = None;
@@ -346,6 +372,7 @@ impl Engine {
             }
         }
         if let Some(tau_hold) = self.prices.tau_hold_hours() {
+            let tau_eff = self.prices.tau_effective_hours().unwrap_or(tau_hold);
             self.retire_dominated(now, tau_hold, &mut actions);
             for id in self.cached.clone() {
                 let node = self.trie.node(id);
@@ -357,20 +384,31 @@ impl Engine {
                     self.cached.remove(&id);
                     continue;
                 };
-                let hold_until = node.stats.t_last + tau_hold;
+                // Per-node hold: the learned hint when this prefix has shown it
+                // recurs after a lull, else the conservative floor; never past
+                // tau_effective.
+                let node_hold = if node.hold_hint > tau_hold {
+                    node.hold_hint.min(tau_eff)
+                } else {
+                    tau_hold
+                };
+                let hold_until = node.stats.t_last + node_hold;
                 // Rate-informed early exit: with a confident estimator, if the
                 // majority of observed gaps exceed the break-even hold time,
                 // storage between hits costs more than recreation on average.
                 let early = node.stats.samples >= self.cfg.confidence_samples
-                    && node.stats.gap_fraction_gt(tau_hold) > 0.5;
+                    && node.stats.gap_fraction_gt(node_hold) > 0.5;
                 if now >= hold_until || early {
                     // Emit Delete even if the TTL just lapsed on its own (the
                     // controller extends exactly to the hold boundary, so the
-                    // two coincide); provider deletes are idempotent.
+                    // two coincide); provider deletes are idempotent. Record the
+                    // delete time so a quick return can be recognized as
+                    // premature (learned-hold feedback in `observe`).
                     actions.push(Action::Delete { node: id });
                     let node = self.trie.node_mut(id);
                     node.state = CacheState::Uncached;
                     node.last_flip = now;
+                    node.last_delete = now;
                     self.cached.remove(&id);
                 } else if expires_at_hours <= now {
                     // Extension cadence was missed and the provider expired the
@@ -583,6 +621,62 @@ mod tests {
         assert!(deleted_at >= last_hit + tau_hold - 1e-9);
         assert!(deleted_at <= last_hit + tau_hold + 2.0 / 60.0);
         assert_eq!(eng.cached_nodes().count(), 0);
+    }
+
+    #[test]
+    fn learned_hold_grows_after_a_premature_delete() {
+        // Warm a prefix, let it delete after tau_hold, then send a request
+        // just after the delete — a premature delete. The node's hold_hint
+        // must grow so it will next hold longer, and a genuinely-idle prefix
+        // (no quick return) must keep hold_hint at zero.
+        let prices = PriceSheet::gemini_pro_like();
+        let tau_hold = prices.tau_hold_hours().unwrap();
+        let tau_eff = prices.tau_effective_hours().unwrap();
+        let mut eng = Engine::new(prices, Config::default());
+        let blocks = prefix(20);
+
+        // Active burst so the cache is created and confirmed.
+        let mut node = None;
+        for m in 0..30u32 {
+            let now = m as f64 / 60.0;
+            let obs = eng.observe(&blocks, now);
+            for a in &obs.actions {
+                if let Action::Create { node: n, .. } = a {
+                    eng.confirm_create(*n, now);
+                    node = Some(*n);
+                }
+            }
+            eng.tick(now);
+        }
+        let node = node.expect("cache created");
+        assert_eq!(eng.trie().node(node).hold_hint, 0.0, "no premature yet");
+
+        // Go idle just past tau_hold so it deletes, then return right after.
+        let last = 29.0 / 60.0;
+        let mut deleted_at = None;
+        for k in 1..=40u32 {
+            let now = last + k as f64 / 60.0;
+            for a in eng.tick(now) {
+                if matches!(a, Action::Delete { .. }) {
+                    deleted_at = Some(now);
+                }
+            }
+            if deleted_at.is_some() {
+                break;
+            }
+        }
+        let deleted_at = deleted_at.expect("must delete after tau_hold");
+        // A request one minute after the delete = premature return.
+        eng.observe(&blocks, deleted_at + 1.0 / 60.0);
+        let hint = eng.trie().node(node).hold_hint;
+        assert!(
+            hint > tau_hold,
+            "hold_hint {hint} must grow past tau_hold {tau_hold} after a premature delete"
+        );
+        assert!(
+            hint <= tau_eff + 1e-9,
+            "hold_hint must stay bounded by tau_effective"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ A zero-dependency Rust library implementing the PCOE core:
 | `trie` | §3.1 | Decayed prefix trie over hashed token blocks: EWMA arrival rates, inter-arrival gap histograms, GC, node budget. No prompt content retained. |
 | `price` | §2 | Two-regime price sheets (storage-metered / write-premium) with `gemini_pro_like()` and `anthropic_sonnet_like()` presets; `tau_hold = p_in / p_store`. |
 | `plan` | §3.2 | Value function and budgeted tree-knapsack DP for ≤ K breakpoint placement under exclusive coverage, with gap-histogram TTL-tier selection and hysteresis. |
-| `engine` | §3.3 | Ski-rental lifecycle controller emitting `Create` / `Extend` / `Delete` actions with pending-create confirmation (`confirm_create` / `mark_failed` / timeout), rate-informed early exit, dominated-ancestor retirement, fail-open. |
+| `engine` | §3.3 | Ski-rental lifecycle controller emitting `Create` / `Extend` / `Delete` actions with pending-create confirmation (`confirm_create` / `mark_failed` / timeout), a **learned per-node hold** that self-corrects premature deletes (zero-regression bursty fix), dominated-ancestor retirement, fail-open. |
 | `shape` | §3.4a | Stable→volatile boundary detection from trie fan-out: where the cacheable prefix ends, and what a cache point there would earn. |
 | `engine` (micro-batch) | §3.4b | Opt-in write-amortizing micro-batching: followers of an in-flight cache write get bounded `Defer` advice so one write premium covers the batch. |
 | `router` | §3.4c | Cross-provider routing on cache-state-aware marginal input cost (read-only quotes that don't pollute traffic stats). |
@@ -96,19 +96,24 @@ prices:
 |---|---|---|---|
 | **business-day** (one big prefix, nightly idle) | **−69%** | −50% | 1.03× |
 | **multi-tenant** (12 staggered tenants) | **−71%** | −46% | 1.12× |
-| **bursty** (bimodal hot/cold) | −76% | **+7% (loses)** | 1.30× |
+| **bursty** (bimodal hot/cold) | **−77%** | +1% | ≈1.21× (mean) |
 
 - **Strong win** where a big prefix goes idle (nights, weekends) or where many
   tenants have their own hours — cases no single hand-set TTL covers. This is the
   product's core: Gemini storage-metered caching across many tenants.
-- **Competitive** with a *well-tuned* static TTL on clean single-prefix traffic;
-  PCOE edges it out over enough days but the margin is small.
-- **Loses to plain cache-everything on bimodal bursty traffic** — PCOE's greedy
-  per-gap ski-rental deletes during a cold lull right before the next burst. The
-  offline oracle shows ~30% headroom a burst-*predicting* controller would
-  recover; that predictor is the top item in DESIGN.md §8 future work. The
-  `bursty_bimodal_exposes_greedy_ski_rental_myopia` test pins this limitation so
-  it can't regress silently.
+- **Competitive** with a *well-tuned* static TTL on clean single-prefix traffic —
+  PCOE's value is adapting when no single TTL fits, not beating a hand-tuned one
+  on a metronome-regular workload.
+- **Bimodal bursty traffic is the hardest case.** A purely greedy controller
+  deletes during a cold lull right before the next burst and *loses* to
+  cache-everything (competitive ratio ≈1.29). The **learned per-node hold** (a
+  prefix that keeps getting hit right after a delete grows its hold and rides
+  through the lulls) recovers most of that — mean ratio ≈1.21, and it now roughly
+  ties cache-everything instead of losing. Crucially this is a **zero-regression**
+  fix: business-day and multi-tenant never premature-delete, so the learner never
+  fires and their numbers are unchanged. The residual gap to the oracle is the
+  part that genuinely needs *burst prediction* (DESIGN.md §8). Both the improvement
+  and the residual headroom are pinned by tests.
 
 **Decision rule:** worth deploying if you spend enough on LLM input tokens that a
 large shared prefix sits idle for meaningful stretches, or you manage many tenants
